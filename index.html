@@ -410,6 +410,8 @@
       const [editTask, setEditTask] = useState(null);
       const [filterProject, setFilterProject] = useState("すべて");
       const [filterStatus, setFilterStatus] = useState("すべて");
+      const [filterAssignee, setFilterAssignee] = useState("すべて");
+      const [sortKey, setSortKey] = useState("none");
       const [search, setSearch] = useState("");
 
       useEffect(() => {
@@ -467,11 +469,23 @@
         </div>
       );
 
+      const PRIORITY_ORDER = { "緊急": 0, "高": 1, "中": 2, "低": 3 };
+
       const filtered = tasks.filter(t => {
         if (filterProject !== "すべて" && t.project !== filterProject) return false;
         if (filterStatus !== "すべて" && t.status !== filterStatus) return false;
+        if (filterAssignee !== "すべて" && t.assignee !== filterAssignee) return false;
         if (search && !t.title.toLowerCase().includes(search.toLowerCase()) && !t.assignee.includes(search)) return false;
         return true;
+      }).sort((a, b) => {
+        if (sortKey === "priority") return (PRIORITY_ORDER[a.priority] ?? 9) - (PRIORITY_ORDER[b.priority] ?? 9);
+        if (sortKey === "due") {
+          if (!a.due && !b.due) return 0;
+          if (!a.due) return 1;
+          if (!b.due) return -1;
+          return a.due.localeCompare(b.due);
+        }
+        return 0;
       });
       const completed = tasks.filter(t => t.status === "完了").length;
       const progress = tasks.length ? Math.round((completed / tasks.length) * 100) : 0;
@@ -506,6 +520,14 @@
               </select>
               <select className="border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white" value={filterStatus} onChange={e => setFilterStatus(e.target.value)}>
                 <option>すべて</option>{STATUSES.map(s => <option key={s}>{s}</option>)}
+              </select>
+              <select className="border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white" value={filterAssignee} onChange={e => setFilterAssignee(e.target.value)}>
+                <option>すべて</option>{members.map(m => <option key={m}>{m}</option>)}
+              </select>
+              <select className="border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white" value={sortKey} onChange={e => setSortKey(e.target.value)}>
+                <option value="none">並び替え</option>
+                <option value="priority">優先度順</option>
+                <option value="due">期限順</option>
               </select>
             </div>
             <div className="space-y-3">
