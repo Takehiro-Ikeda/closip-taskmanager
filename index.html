@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>チームタスク管理 | closip</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useCallback } = React;
+
+    // ─── Firebase Config ──────────────────────────────────
+    const FIREBASE_CONFIG = {
+      apiKey: "AIzaSyC0dfhDWOliT0Y378Tn5aioWlfA0xkKu8U",
+      projectId: "closip-taskmanager",
+    };
+    const BASE_URL = `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents`;
+
+    async function fsGet(col, id) {
+      const res = await fetch(`${BASE_URL}/${col}/${id}?key=${FIREBASE_CONFIG.apiKey}`);
+      if (!res.ok) return null;
+      const data = await res.json();
+      return firestoreToJs(data.fields);
+    }
+    async function fsSet(col, id, obj) {
+      await fetch(`${BASE_URL}/${col}/${id}?key=${FIREBASE_CONFIG.apiKey}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fields: jsToFirestore(obj) }),
+      });
+    }
+    async function fsDelete(col, id) {
+      await fetch(`${BASE_URL}/${col}/${id}?key=${FIREBASE_CONFIG.apiKey}`, { method: "DELETE" });
+    }
+    async function fsList(col) {
+      const res = await fetch(`${BASE_URL}/${col}?key=${FIREBASE_CONFIG.apiKey}`);
+      if (!res.ok) return [];
+      const data = await res.json();
+      if (!data.documents) return [];
+      return data.documents.map(doc => ({ _id: doc.name.split("/").pop(), ...firestoreToJs(doc.fields) }));
+    }
+    function jsToFirestore(obj) {
+      const f = {};
+      for (const [k, v] of Object.entries(obj)) {
+        if (v === null || v === undefined) f[k] = { nullValue: null };
+        else if (typeof v === "string") f[k] = { stringValue: v };
+        else if (typeof v === "number") f[k] = { integerValue: String(v) };
+        else if (typeof v === "boolean") f[k] = { booleanValue: v };
+        else if (Array.isArray(v)) f[k] = { arrayValue: { values: v.map(i => typeof i === "string" ? { stringValue: i } : { mapValue: { fields: jsToFirestore(i) } }) } };
+        else if (typeof v === "object") f[k] = { mapValue: { fields: jsToFirestore(v) } };
+      }
+      return f;
+    }
+    function firestoreToJs(fields) {
+      if (!fields) return {};
+      const obj = {};
+      for (const [k, v] of Object.entries(fields)) {
+        if (v.stringValue !== undefined) obj[k] = v.stringValue;
+        else if (v.integerValue !== undefined) obj[k] = Number(v.integerValue);
+        else if (v.booleanValue !== undefined) obj[k] = v.booleanValue;
+        else if (v.nullValue !== undefined) obj[k] = null;
+        else if (v.arrayValue) obj[k] = (v.arrayValue.values || []).map(i => i.stringValue !== undefined ? i.stringValue : firestoreToJs(i.mapValue?.fields));
+        else if (v.mapValue) obj[k] = firestoreToJs(v.mapValue.fields);
+      }
+      return obj;
+    }
+
+    // ─── Constants ────────────────────────────────────────
+    const STATUSES = ["未着手", "進行中", "レビュー中", "完了"];
+    const PRIORITIES = ["低", "中", "高", "緊急"];
+    const PROJECTS = ["closip SIM", "SapiaBox", "生成AIセミナー", "タニタプロジェクト", "その他"];
+    const STATUS_COLORS = { "未着手": "bg-gray-100 text-gray-600", "進行中": "bg-blue-100 text-blue-700", "レビュー中": "bg-yellow-100 text-yellow-700", "完了": "bg-green-100 text-green-700" };
+    const PRIORITY_COLORS = { "低": "bg-slate-100 text-slate-500", "中": "bg-blue-100 text-blue-600", "高": "bg-orange-100 text-orange-600", "緊急": "bg-red-100 text-red-600" };
+    const ADMIN_RAW = { id: "admin-ikeda", email: "ikeda@closip.co.jp", password: "ikeda", name: "池田", role: "admin" };
+    const DEFAULT_TASKS = [
+      { id: "task-1", title: "SapiaBoxデモ環境構築", project: "SapiaBox", assignee: "池田", priority: "高", status: "進行中", due: "2026-03-10", description: "DGX Sparkベースのデモ環境を整備する" },
+      { id: "task-2", title: "セミナー第3回資料作成", project: "生成AIセミナー", assignee: "田中", priority: "中", status: "未着手", due: "2026-03-15", description: "実務応用編の資料を作成する" },
+      { id: "task-3", title: "closip SIM顧客提案書", project: "closip SIM", assignee: "鈴木", priority: "緊急", status: "レビュー中", due: "2026-03-05", description: "新規顧客向け提案書のレビュー" },
+    ];
+
+    function genId() { return `${Date.now()}-${Math.random().toString(36).slice(2)}`; }
+    async function hashPassword(pw) {
+      const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(pw + "closip_salt"));
+      return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+    }
+
+    // ─── Modal ────────────────────────────────────────────
+    function Modal({ open, onClose, children }) {
+      if (!open) return null;
+      return (
+        <div className="fixed inset-0 bg-black bg-opacity-40 z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-screen overflow-y-auto">{children}</div>
+        </div>
+      );
+    }
+
+    // ─── Login ────────────────────────────────────────────
+    function LoginScreen({ onLogin }) {
+      const [email, setEmail] = useState("");
+      const [password, setPassword] = useState("");
+      const [error, setError] = useState("");
+      const [show, setShow] = useState(false);
+      const [loading, setLoading] = useState(false);
+
+      const handleSubmit = async () => {
+        setError(""); setLoading(true);
+        try {
+          let admin = await fsGet("users", ADMIN_RAW.id);
+          if (!admin) {
+            const hashed = await hashPassword(ADMIN_RAW.password);
+            admin = { ...ADMIN_RAW, password: hashed };
+            await fsSet("users", ADMIN_RAW.id, admin);
+          }
+          const users = await fsList("users");
+          const hashed = await hashPassword(password);
+          const found = users.find(u => u.email === email && u.password === hashed);
+          if (found) onLogin(found);
+          else setError("メールアドレスまたはパスワードが正しくありません");
+        } catch(e) {
+          setError("接続エラー: " + e.message);
+        }
+        setLoading(false);
+      };
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-blue-50 via-white to-purple-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl shadow-xl w-full max-w-sm p-8">
+            <div className="text-center mb-8">
+              <div className="text-4xl mb-3">📋</div>
+              <h1 className="text-2xl font-bold text-gray-800">チームタスク管理</h1>
+              <p className="text-sm text-gray-400 mt-1">closip チームポータル</p>
+            </div>
+            <div className="space-y-4">
+              <div>
+                <label className="text-xs font-semibold text-gray-500 uppercase tracking-wide">メールアドレス</label>
+                <input className="w-full mt-1.5 border border-gray-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+                  type="email" placeholder="email@closip.co.jp"
+                  value={email} onChange={e => setEmail(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && handleSubmit()} />
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-gray-500 uppercase tracking-wide">パスワード</label>
+                <div className="relative mt-1.5">
+                  <input className="w-full border border-gray-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 pr-10"
+                    type={show ? "text" : "password"} placeholder="••••••••"
+                    value={password} onChange={e => setPassword(e.target.value)}
+                    onKeyDown={e => e.key === "Enter" && handleSubmit()} />
+                  <button onClick={() => setShow(s => !s)} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 text-xs">{show ? "隠す" : "表示"}</button>
+                </div>
+              </div>
+              {error && <p className="text-xs text-red-500 bg-red-50 rounded-lg px-3 py-2">{error}</p>}
+              <button onClick={handleSubmit} disabled={loading} className="w-full bg-blue-600 text-white rounded-xl py-3 text-sm font-semibold hover:bg-blue-700 transition disabled:opacity-60">
+                {loading ? "確認中..." : "ログイン"}
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── User Management ──────────────────────────────────
+    function UserManagementModal({ onClose, onUsersChanged }) {
+      const [users, setUsers] = useState([]);
+      const [form, setForm] = useState({ name: "", email: "", password: "", role: "member" });
+      const [error, setError] = useState("");
+      const [tab, setTab] = useState("list");
+      const [saving, setSaving] = useState(false);
+
+      useEffect(() => { fsList("users").then(setUsers); }, []);
+
+      const handleAdd = async () => {
+        setError("");
+        if (!form.name || !form.email || !form.password) return setError("すべての項目を入力してください");
+        if (users.find(u => u.email === form.email)) return setError("このメールアドレスは既に登録されています");
+        setSaving(true);
+        const id = genId();
+        const hashed = await hashPassword(form.password);
+        const newUser = { ...form, password: hashed, id };
+        await fsSet("users", id, newUser);
+        setUsers(u => [...u, { ...newUser, _id: id }]);
+        setForm({ name: "", email: "", password: "", role: "member" });
+        setTab("list");
+        setSaving(false);
+        onUsersChanged();
+      };
+
+      const handleDelete = async (u) => {
+        if ((u.id || u._id) === ADMIN_RAW.id) return alert("管理者アカウントは削除できません");
+        if (!confirm("このユーザーを削除しますか？")) return;
+        const docId = u._id || u.id;
+        await fsDelete("users", docId);
+        setUsers(prev => prev.filter(x => (x._id || x.id) !== docId));
+        onUsersChanged();
+      };
+
+      return (
+        <div className="p-6">
+          <div className="flex items-center justify-between mb-5">
+            <h2 className="text-xl font-bold text-gray-800">👥 ユーザー管理</h2>
+            <div className="flex gap-2">
+              <button onClick={() => setTab("list")} className={`text-xs px-3 py-1.5 rounded-lg font-medium transition ${tab === "list" ? "bg-blue-600 text-white" : "bg-gray-100 text-gray-600"}`}>一覧</button>
+              <button onClick={() => setTab("add")} className={`text-xs px-3 py-1.5 rounded-lg font-medium transition ${tab === "add" ? "bg-blue-600 text-white" : "bg-gray-100 text-gray-600"}`}>＋ 追加</button>
+            </div>
+          </div>
+          {tab === "list" && (
+            <div className="space-y-2">
+              {users.length === 0 && <p className="text-sm text-gray-400 text-center py-4">読み込み中...</p>}
+              {users.map(u => (
+                <div key={u._id || u.id} className="flex items-center justify-between bg-gray-50 rounded-xl px-4 py-3">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-semibold text-gray-800">{u.name}</span>
+                      <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${u.role === "admin" ? "bg-purple-100 text-purple-600" : "bg-blue-100 text-blue-600"}`}>{u.role === "admin" ? "管理者" : "メンバー"}</span>
+                    </div>
+                    <p className="text-xs text-gray-400 mt-0.5">{u.email}</p>
+                  </div>
+                  <button onClick={() => handleDelete(u)} className="text-gray-300 hover:text-red-400 text-sm p-1">🗑️</button>
+                </div>
+              ))}
+            </div>
+          )}
+          {tab === "add" && (
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-semibold text-gray-500">名前</label>
+                  <input className="w-full mt-1 border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="田中" />
+                </div>
+                <div>
+                  <label className="text-xs font-semibold text-gray-500">ロール</label>
+                  <select className="w-full mt-1 border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" value={form.role} onChange={e => setForm(f => ({ ...f, role: e.target.value }))}>
+                    <option value="member">メンバー</option>
+                    <option value="admin">管理者</option>
+                  </select>
+                </div>
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-gray-500">メールアドレス</label>
+                <input className="w-full mt-1 border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" type="email" value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} placeholder="tanaka@closip.co.jp" />
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-gray-500">パスワード</label>
+                <input className="w-full mt-1 border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" type="text" value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))} placeholder="初期パスワード" />
+              </div>
+              {error && <p className="text-xs text-red-500 bg-red-50 rounded-lg px-3 py-2">{error}</p>}
+              <button onClick={handleAdd} disabled={saving} className="w-full bg-blue-600 text-white rounded-xl py-2.5 text-sm font-semibold hover:bg-blue-700 transition disabled:opacity-60">{saving ? "追加中..." : "追加する"}</button>
+            </div>
+          )}
+          <button onClick={onClose} className="mt-5 w-full border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-medium hover:bg-gray-50 transition">閉じる</button>
+        </div>
+      );
+    }
+
+    // ─── Task Form ────────────────────────────────────────
+    function TaskForm({ task, members, onSave, onClose }) {
+      const [form, setForm] = useState(task || { title: "", project: PROJECTS[0], assignee: members[0] || "", priority: "中", status: "未着手", due: "", description: "" });
+      const [aiLoading, setAiLoading] = useState(false);
+      const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+      const handleAI = async () => {
+        if (!form.title) return alert("タイトルを入力してください");
+        setAiLoading(true);
+        try {
+          const res = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: "claude-sonnet-4-20250514", max_tokens: 1000,
+              messages: [{ role: "user", content: `以下のタスク情報からJSON形式で description（タスクの詳細説明、100文字程度）と suggestedPriority（低/中/高/緊急のいずれか）を提案してください。JSONのみ返してください。\nタスク名: ${form.title}\nプロジェクト: ${form.project}\n担当者: ${form.assignee}` }]
+            })
+          });
+          const data = await res.json();
+          const text = data.content.map(i => i.text || "").join("");
+          const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+          setForm(f => ({ ...f, description: parsed.description || f.description, priority: parsed.suggestedPriority || f.priority }));
+        } catch { alert("AI提案に失敗しました"); }
+        setAiLoading(false);
+      };
+
+      return (
+        <div className="p-6">
+          <h2 className="text-xl font-bold text-gray-800 mb-5">{task ? "タスク編集" : "タスク追加"}</h2>
+          <div className="space-y-4">
+            <div>
+              <label className="text-xs font-semibold text-gray-500">タイトル *</label>
+              <input className="w-full mt-1 border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" value={form.title} onChange={e => set("title", e.target.value)} placeholder="タスク名を入力" />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-xs font-semibold text-gray-500">プロジェクト</label>
+                <select className="w-full mt-1 border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" value={form.project} onChange={e => set("project", e.target.value)}>
+                  {PROJECTS.map(p => <option key={p}>{p}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-gray-500">担当者</label>
+                <select className="w-full mt-1 border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" value={form.assignee} onChange={e => set("assignee", e.target.value)}>
+                  {members.map(m => <option key={m}>{m}</option>)}
+                </select>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-xs font-semibold text-gray-500">優先度</label>
+                <select className="w-full mt-1 border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" value={form.priority} onChange={e => set("priority", e.target.value)}>
+                  {PRIORITIES.map(p => <option key={p}>{p}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="text-xs font-semibold text-gray-500">ステータス</label>
+                <select className="w-full mt-1 border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" value={form.status} onChange={e => set("status", e.target.value)}>
+                  {STATUSES.map(s => <option key={s}>{s}</option>)}
+                </select>
+              </div>
+            </div>
+            <div>
+              <label className="text-xs font-semibold text-gray-500">期限</label>
+              <input type="date" className="w-full mt-1 border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400" value={form.due} onChange={e => set("due", e.target.value)} />
+            </div>
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-xs font-semibold text-gray-500">詳細説明</label>
+                <button onClick={handleAI} disabled={aiLoading} className="text-xs bg-purple-50 text-purple-600 border border-purple-200 rounded-lg px-3 py-1 hover:bg-purple-100 transition disabled:opacity-50">
+                  {aiLoading ? "✨ 生成中..." : "✨ AI提案"}
+                </button>
+              </div>
+              <textarea className="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 resize-none" rows={3} value={form.description} onChange={e => set("description", e.target.value)} placeholder="タスクの詳細（またはAI提案を使用）" />
+            </div>
+          </div>
+          <div className="flex gap-3 mt-6">
+            <button onClick={() => onSave(form)} className="flex-1 bg-blue-600 text-white rounded-xl py-2.5 text-sm font-semibold hover:bg-blue-700 transition">保存</button>
+            <button onClick={onClose} className="flex-1 border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-medium hover:bg-gray-50 transition">キャンセル</button>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── AI Summary ───────────────────────────────────────
+    function AISummaryModal({ tasks, onClose }) {
+      const [summary, setSummary] = useState("");
+      const [loading, setLoading] = useState(true);
+      useEffect(() => {
+        (async () => {
+          try {
+            const res = await fetch("https://api.anthropic.com/v1/messages", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                model: "claude-sonnet-4-20250514", max_tokens: 1000,
+                messages: [{ role: "user", content: `以下のチームタスク一覧を分析して、日本語で簡潔な進捗サマリーを作成してください。\n- 全体の状況\n- リスク・懸念点\n- 推奨アクション\nを箇条書きでまとめてください。\n\nタスク一覧:\n${tasks.map(t => `[${t.status}] ${t.title} (優先度:${t.priority}, 担当:${t.assignee}, 期限:${t.due || "未設定"})`).join("\n")}` }]
+              })
+            });
+            const data = await res.json();
+            setSummary(data.content.map(i => i.text || "").join(""));
+          } catch { setSummary("サマリーの生成に失敗しました。"); }
+          setLoading(false);
+        })();
+      }, []);
+      return (
+        <div className="p-6">
+          <h2 className="text-xl font-bold text-gray-800 mb-4">✨ AI進捗サマリー</h2>
+          {loading ? (
+            <div className="text-center py-8 text-gray-500"><div className="text-3xl mb-3 animate-pulse">🤖</div><p className="text-sm">AIが分析中...</p></div>
+          ) : (
+            <div className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed bg-purple-50 rounded-xl p-4">{summary}</div>
+          )}
+          <button onClick={onClose} className="mt-5 w-full border border-gray-200 text-gray-600 rounded-xl py-2.5 text-sm font-medium hover:bg-gray-50 transition">閉じる</button>
+        </div>
+      );
+    }
+
+    // ─── Chart ────────────────────────────────────────────
+    function Chart({ tasks }) {
+      const sc = STATUSES.map(s => ({ label: s, count: tasks.filter(t => t.status === s).length }));
+      const pc = PRIORITIES.map(p => ({ label: p, count: tasks.filter(t => t.priority === p).length }));
+      const m1 = Math.max(...sc.map(s => s.count), 1), m2 = Math.max(...pc.map(p => p.count), 1);
+      const sC = ["bg-gray-300","bg-blue-400","bg-yellow-400","bg-green-400"];
+      const pC = ["bg-slate-300","bg-blue-400","bg-orange-400","bg-red-400"];
+      return (
+        <div className="grid grid-cols-2 gap-4 mb-6">
+          {[{title:"ステータス別",data:sc,max:m1,colors:sC},{title:"優先度別",data:pc,max:m2,colors:pC}].map(({title,data,max,colors})=>(
+            <div key={title} className="bg-white rounded-2xl p-4 shadow-sm border border-gray-100">
+              <p className="text-xs font-semibold text-gray-500 mb-3">{title}</p>
+              <div className="space-y-2">
+                {data.map(({label,count},i)=>(
+                  <div key={label}>
+                    <div className="flex justify-between text-xs text-gray-500 mb-0.5"><span>{label}</span><span>{count}</span></div>
+                    <div className="h-2 bg-gray-100 rounded-full overflow-hidden"><div className={`h-full rounded-full ${colors[i]} transition-all`} style={{width:`${(count/max)*100}%`}}/></div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // ─── Main App ─────────────────────────────────────────
+    function App() {
+      const [currentUser, setCurrentUser] = useState(null);
+      const [tasks, setTasks] = useState([]);
+      const [members, setMembers] = useState([ADMIN_RAW.name]);
+      const [loaded, setLoaded] = useState(false);
+      const [modal, setModal] = useState(null);
+      const [editTask, setEditTask] = useState(null);
+      const [filterProject, setFilterProject] = useState("すべて");
+      const [filterStatus, setFilterStatus] = useState("すべて");
+      const [search, setSearch] = useState("");
+
+      useEffect(() => {
+        if (!currentUser) return;
+        (async () => {
+          const existingTasks = await fsList("tasks");
+          if (existingTasks.length === 0) {
+            for (const t of DEFAULT_TASKS) await fsSet("tasks", t.id, t);
+            setTasks(DEFAULT_TASKS);
+          } else {
+            setTasks(existingTasks.map(t => ({ ...t, id: t._id || t.id })));
+          }
+          const users = await fsList("users");
+          setMembers(users.map(u => u.name));
+          setLoaded(true);
+        })();
+      }, [currentUser]);
+
+      const refreshMembers = async () => { const u = await fsList("users"); setMembers(u.map(u => u.name)); };
+
+      const handleSave = async (form) => {
+        if (!form.title.trim()) return alert("タイトルを入力してください");
+        if (editTask) {
+          const id = editTask._id || editTask.id;
+          await fsSet("tasks", id, { ...form, id });
+          setTasks(prev => prev.map(t => (t._id || t.id) === id ? { ...form, id } : t));
+        } else {
+          const id = genId();
+          const newTask = { ...form, id };
+          await fsSet("tasks", id, newTask);
+          setTasks(prev => [...prev, newTask]);
+        }
+        setModal(null); setEditTask(null);
+      };
+
+      const handleDelete = async (task) => {
+        if (!confirm("削除しますか？")) return;
+        const id = task._id || task.id;
+        await fsDelete("tasks", id);
+        setTasks(prev => prev.filter(t => (t._id || t.id) !== id));
+      };
+
+      const handleStatusChange = async (task, status) => {
+        const id = task._id || task.id;
+        const updated = { ...task, status, id };
+        await fsSet("tasks", id, updated);
+        setTasks(prev => prev.map(t => (t._id || t.id) === id ? updated : t));
+      };
+
+      if (!currentUser) return <LoginScreen onLogin={setCurrentUser} />;
+      if (!loaded) return (
+        <div className="flex flex-col items-center justify-center h-screen text-gray-400 gap-3">
+          <div className="text-3xl animate-pulse">📋</div>
+          <p className="text-sm">Firebaseに接続中...</p>
+        </div>
+      );
+
+      const filtered = tasks.filter(t => {
+        if (filterProject !== "すべて" && t.project !== filterProject) return false;
+        if (filterStatus !== "すべて" && t.status !== filterStatus) return false;
+        if (search && !t.title.toLowerCase().includes(search.toLowerCase()) && !t.assignee.includes(search)) return false;
+        return true;
+      });
+      const completed = tasks.filter(t => t.status === "完了").length;
+      const progress = tasks.length ? Math.round((completed / tasks.length) * 100) : 0;
+      const isAdmin = currentUser.role === "admin";
+
+      return (
+        <div className="min-h-screen bg-gray-50">
+          <div className="bg-white border-b border-gray-100 px-6 py-4 flex items-center justify-between">
+            <div>
+              <h1 className="text-lg font-bold text-gray-800">📋 チームタスク管理</h1>
+              <p className="text-xs text-gray-400 mt-0.5">{tasks.length}件 · 完了率 {progress}%</p>
+            </div>
+            <div className="flex items-center gap-2">
+              {isAdmin && <button onClick={() => setModal("users")} className="text-sm bg-gray-100 text-gray-600 rounded-xl px-3 py-2 hover:bg-gray-200 transition font-medium">👥 ユーザー管理</button>}
+              <button onClick={() => setModal("summary")} className="text-sm bg-purple-50 text-purple-600 border border-purple-200 rounded-xl px-3 py-2 hover:bg-purple-100 transition font-medium">✨ AIサマリー</button>
+              <button onClick={() => { setEditTask(null); setModal("task"); }} className="text-sm bg-blue-600 text-white rounded-xl px-3 py-2 hover:bg-blue-700 transition font-medium">＋ タスク追加</button>
+              <div className="flex items-center gap-2 ml-2 pl-3 border-l border-gray-100">
+                <div className="text-right">
+                  <p className="text-xs font-semibold text-gray-700">{currentUser.name}</p>
+                  <p className="text-xs text-gray-400">{isAdmin ? "管理者" : "メンバー"}</p>
+                </div>
+                <button onClick={() => setCurrentUser(null)} className="text-xs text-gray-400 hover:text-red-400 transition px-2 py-1 rounded-lg hover:bg-red-50">ログアウト</button>
+              </div>
+            </div>
+          </div>
+          <div className="max-w-5xl mx-auto px-4 py-6">
+            <Chart tasks={tasks} />
+            <div className="flex flex-wrap gap-2 mb-4">
+              <input className="border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white" placeholder="🔍 検索..." value={search} onChange={e => setSearch(e.target.value)} />
+              <select className="border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white" value={filterProject} onChange={e => setFilterProject(e.target.value)}>
+                <option>すべて</option>{PROJECTS.map(p => <option key={p}>{p}</option>)}
+              </select>
+              <select className="border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white" value={filterStatus} onChange={e => setFilterStatus(e.target.value)}>
+                <option>すべて</option>{STATUSES.map(s => <option key={s}>{s}</option>)}
+              </select>
+            </div>
+            <div className="space-y-3">
+              {filtered.length === 0 && <div className="text-center py-12 text-gray-400 text-sm bg-white rounded-2xl border border-gray-100">タスクがありません</div>}
+              {filtered.map(t => (
+                <div key={t._id || t.id} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 hover:shadow-md transition">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap mb-1">
+                        <span className="font-semibold text-gray-800 text-sm">{t.title}</span>
+                        <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${PRIORITY_COLORS[t.priority]}`}>{t.priority}</span>
+                      </div>
+                      {t.description && <p className="text-xs text-gray-500 mb-2 line-clamp-2">{t.description}</p>}
+                      <div className="flex items-center gap-3 flex-wrap text-xs text-gray-400">
+                        <span>📁 {t.project}</span><span>👤 {t.assignee}</span>{t.due && <span>📅 {t.due}</span>}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <select className={`text-xs px-2 py-1 rounded-lg border-0 font-medium cursor-pointer focus:outline-none ${STATUS_COLORS[t.status]}`} value={t.status} onChange={e => handleStatusChange(t, e.target.value)}>
+                        {STATUSES.map(s => <option key={s}>{s}</option>)}
+                      </select>
+                      <button onClick={() => { setEditTask(t); setModal("task"); }} className="text-gray-400 hover:text-blue-500 text-sm p-1">✏️</button>
+                      {isAdmin && <button onClick={() => handleDelete(t)} className="text-gray-400 hover:text-red-500 text-sm p-1">🗑️</button>}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+          <Modal open={modal === "task"} onClose={() => { setModal(null); setEditTask(null); }}>
+            <TaskForm task={editTask} members={members} onSave={handleSave} onClose={() => { setModal(null); setEditTask(null); }} />
+          </Modal>
+          <Modal open={modal === "summary"} onClose={() => setModal(null)}>
+            {modal === "summary" && <AISummaryModal tasks={tasks} onClose={() => setModal(null)} />}
+          </Modal>
+          <Modal open={modal === "users"} onClose={() => { setModal(null); refreshMembers(); }}>
+            {modal === "users" && <UserManagementModal onClose={() => { setModal(null); refreshMembers(); }} onUsersChanged={refreshMembers} />}
+          </Modal>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
